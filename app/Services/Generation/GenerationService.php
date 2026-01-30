@@ -11,6 +11,7 @@ use App\Services\CustomApiService;
 use App\Services\WordPressApiService;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class GenerationService
@@ -67,7 +68,7 @@ class GenerationService
             }
 
             try {
-                $article = $this->generateArticle($template->articlePromt->promt, $topic->topic, $site->url);
+                $article = $this->generateArticle($template->articlePromt->promt, $topic->topic, $site->url, $run);
 
                 $title = trim((string) ($article['title'] ?? ''));
                 $contentHtml = (string) ($article['content_html'] ?? '');
@@ -83,6 +84,7 @@ class GenerationService
                     title: $title,
                     suggestedSlug: (string) ($article['slug'] ?? ''),
                     slugPromt: $template->slugPromt?->promt,
+                    run: $run,
                 );
 
                 $selectedCategories = $this->selectCategories(
@@ -92,6 +94,7 @@ class GenerationService
                     summary: $summary !== '' ? $summary : $excerpt,
                     max: (int) $template->max_categories_per_article,
                     categoryPromt: $template->categoryPromt?->promt,
+                    run: $run,
                 );
 
                 $localCategoryIds = $isCustom
@@ -121,7 +124,7 @@ class GenerationService
                 if ($uniqueness < (int) $template->uniqueness_min_percent) {
                     $rewrite = $template->rewritePromt?->promt;
                     if (is_string($rewrite) && trim($rewrite) !== '') {
-                        $rewritten = $this->rewriteArticle($rewrite, $topic->topic, $title, $contentHtml);
+                        $rewritten = $this->rewriteArticle($rewrite, $topic->topic, $title, $contentHtml, $run);
                         if ($rewritten !== '') {
                             $contentHtml = $rewritten;
                             $uniqueness = $this->uniq->uniquenessPercent($contentHtml, $recent);
@@ -228,12 +231,14 @@ class GenerationService
         ]);
     }
 
-    private function generateArticle(string $promt, string $topic, string $siteUrl): array
+    private function generateArticle(string $promt, string $topic, string $siteUrl, GenerationRun $run): array
     {
         $userPrompt = $this->renderer->render($promt, [
             'topic' => $topic,
             'site_url' => $siteUrl,
         ]);
+        $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, 'ТЕМА');
+        $userPrompt = $this->appendContextIfMissing($userPrompt, 'site_url', $siteUrl, 'SITE_URL');
 
         $system = 'You are a content generator. Return ONLY valid JSON object with keys: '
             . '"title", "slug", "excerpt", "summary", "content_html". '
@@ -242,24 +247,41 @@ class GenerationService
         $resp = $this->ai->chat([
             ['role' => 'system', 'content' => $system],
             ['role' => 'user', 'content' => $userPrompt],
+        ], [
+            'context' => [
+                'purpose' => 'article',
+                'run_id' => $run->id,
+                'template_id' => $run->generation_template_id,
+                'topic' => $topic,
+            ],
         ]);
 
         return $this->json->parseObject($this->ai->extractFirstMessageContent($resp));
     }
 
-    private function rewriteArticle(string $promt, string $topic, string $title, string $contentHtml): string
+    private function rewriteArticle(string $promt, string $topic, string $title, string $contentHtml, GenerationRun $run): string
     {
         $userPrompt = $this->renderer->render($promt, [
             'topic' => $topic,
             'title' => $title,
             'content_html' => $contentHtml,
         ]);
+        $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, 'ТЕМА');
+        $userPrompt = $this->appendContextIfMissing($userPrompt, 'title', $title, 'ЗАГОЛОВОК');
 
         $system = 'Return ONLY valid JSON object with keys: "content_html".';
 
         $resp = $this->ai->chat([
             ['role' => 'system', 'content' => $system],
             ['role' => 'user', 'content' => $userPrompt],
+        ], [
+            'context' => [
+                'purpose' => 'rewrite',
+                'run_id' => $run->id,
+                'template_id' => $run->generation_template_id,
+                'topic' => $topic,
+                'title' => $title,
+            ],
         ]);
 
         $data = $this->json->parseObject($this->ai->extractFirstMessageContent($resp));
@@ -267,7 +289,7 @@ class GenerationService
         return is_string($data['content_html'] ?? null) ? (string) $data['content_html'] : '';
     }
 
-    private function generateSlug(string $topic, string $title, string $suggestedSlug, ?string $slugPromt): string
+    private function generateSlug(string $topic, string $title, string $suggestedSlug, ?string $slugPromt, ?GenerationRun $run = null): string
     {
         $slug = trim($suggestedSlug);
         if ($slug !== '') {
@@ -279,12 +301,22 @@ class GenerationService
                 'topic' => $topic,
                 'title' => $title,
             ]);
+            $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, 'ТЕМА');
+            $userPrompt = $this->appendContextIfMissing($userPrompt, 'title', $title, 'ЗАГОЛОВОК');
 
             $system = 'Return ONLY valid JSON object with key: "slug".';
 
             $resp = $this->ai->chat([
                 ['role' => 'system', 'content' => $system],
                 ['role' => 'user', 'content' => $userPrompt],
+            ], [
+                'context' => array_filter([
+                    'purpose' => 'slug',
+                    'run_id' => $run?->id,
+                    'template_id' => $run?->generation_template_id,
+                    'topic' => $topic,
+                    'title' => $title,
+                ]),
             ]);
 
             $data = $this->json->parseObject($this->ai->extractFirstMessageContent($resp));
@@ -301,7 +333,7 @@ class GenerationService
     /**
      * @return array<int,string> category names
      */
-    private function selectCategories(int $siteId, string $topic, string $title, string $summary, int $max, ?string $categoryPromt): array
+    private function selectCategories(int $siteId, string $topic, string $title, string $summary, int $max, ?string $categoryPromt, ?GenerationRun $run = null): array
     {
         $max = max(0, $max);
         if ($max === 0) {
@@ -322,12 +354,25 @@ class GenerationService
                 'categories' => implode("\n", $existing),
                 'max' => $max,
             ]);
+            $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, 'ТЕМА');
+            $userPrompt = $this->appendContextIfMissing($userPrompt, 'title', $title, 'ЗАГОЛОВОК');
+            $userPrompt = $this->appendContextIfMissing($userPrompt, 'summary', $summary, 'КРАТКО');
+            $userPrompt = $this->appendContextIfMissing($userPrompt, 'categories', implode("\n", $existing), 'ДОСТУПНЫЕ РУБРИКИ');
+            $userPrompt = $this->appendContextIfMissing($userPrompt, 'max', (string) $max, 'MAX');
 
             $system = 'Return ONLY valid JSON array of category names (strings), max ' . $max . '.';
 
             $resp = $this->ai->chat([
                 ['role' => 'system', 'content' => $system],
                 ['role' => 'user', 'content' => $userPrompt],
+            ], [
+                'context' => array_filter([
+                    'purpose' => 'categories',
+                    'run_id' => $run?->id,
+                    'template_id' => $run?->generation_template_id,
+                    'topic' => $topic,
+                    'title' => $title,
+                ]),
             ]);
 
             $list = $this->json->parseList($this->ai->extractFirstMessageContent($resp));
@@ -356,6 +401,23 @@ class GenerationService
         $picked = array_values(array_filter(array_map(fn ($x) => $x['score'] > 0 ? $x['name'] : null, $scored)));
 
         return array_slice($picked, 0, $max);
+    }
+
+    private function appendContextIfMissing(string $prompt, string $key, string $value, string $label): string
+    {
+        $prompt = rtrim($prompt);
+        $value = trim($value);
+
+        if ($value === '') {
+            return $prompt;
+        }
+
+        // If placeholder exists, user likely placed it intentionally.
+        if (preg_match('/\{\{\s*' . preg_quote($key, '/') . '\s*\}\}/u', $prompt)) {
+            return $prompt;
+        }
+
+        return $prompt . "\n\n{$label}: {$value}\n";
     }
 
 

@@ -8,12 +8,17 @@ class PromptRenderer
 {
     public function render(string $template, array $vars): string
     {
-        $map = [];
+        $out = $template;
+
         foreach ($vars as $k => $v) {
-            $map['{{' . $k . '}}'] = (string) $v;
+            $key = preg_quote((string) $k, '/');
+            $value = (string) $v;
+
+            // Support both {{topic}} and {{ topic }} forms.
+            $out = preg_replace('/\{\{\s*' . $key . '\s*\}\}/u', $value, $out) ?? $out;
         }
 
-        return Str::of($template)->replace(array_keys($map), array_values($map))->toString();
+        return Str::of($out)->toString();
     }
 }
 
