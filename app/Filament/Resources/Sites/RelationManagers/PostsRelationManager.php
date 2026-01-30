@@ -101,12 +101,12 @@ class PostsRelationManager extends RelationManager
                 TextColumn::make('title')
                     ->searchable(),
                 TextColumn::make('status')
-                    ->badge()
-                    ->toggleable(isToggledHiddenByDefault: true),
+                ->badge(),
             ])
             ->filters([
                 //
             ])
+            ->defaultSort('created_at', 'desc')
             ->headerActions([
                 CreateAction::make()
                     ->modalHeading(__('Создать статью'))
