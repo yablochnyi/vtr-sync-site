@@ -14,6 +14,10 @@ class RunGenerationJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
+    public int $timeout = 1200;
+
+    public int $tries = 1;
+
     public function __construct(public int $runId)
     {
     }

@@ -128,6 +128,21 @@ class CustomApiService
         return (array) $response->json();
     }
 
+    public function uploadMedia(string $filePath, string $fileName): array
+    {
+        $response = Http::timeout(120)
+            ->acceptJson()
+            ->withBasicAuth($this->login, $this->password)
+            ->attach('file', file_get_contents($filePath), $fileName)
+            ->post(rtrim($this->url, '/') . '/api/v1/media');
+
+        if ($response->failed()) {
+            throw new \RuntimeException("Custom API uploadMedia failed: {$response->status()} {$response->body()}");
+        }
+
+        return (array) $response->json();
+    }
+
     public function deletePost(int $id): array
     {
         $response = Http::timeout(60)

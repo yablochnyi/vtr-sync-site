@@ -8,16 +8,20 @@ use Filament\Forms\Concerns\InteractsWithForms;
 use Filament\Notifications\Notification;
 use Filament\Pages\Page;
 use Filament\Schemas\Contracts\HasSchemas;
+use Filament\Support\Icons\Heroicon;
 use Illuminate\Contracts\Support\Htmlable;
 use Filament\Schemas\Schema;
 use Illuminate\Support\HtmlString;
+use BackedEnum;
 
 class AiSettings extends Page implements HasSchemas
 {
     use InteractsWithForms;
     protected string $view = 'filament.pages.ai-settings';
     protected static ?string $navigationLabel = 'AI настройки';
-
+    protected static string|BackedEnum|null $navigationIcon = Heroicon::Cog6Tooth;
+    protected static ?int $navigationSort = 9999;
+    protected static bool $shouldRegisterNavigation = false;
     public static ?string $title = 'AI настройки';
 
     public ?array $data = [];

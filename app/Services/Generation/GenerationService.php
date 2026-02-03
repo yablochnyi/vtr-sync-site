@@ -12,10 +12,14 @@ use App\Services\WordPressApiService;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
 class GenerationService
 {
+    private const TOPIC_LABEL = 'ТЕМА И КЛЮЧЕВОЕ СЛОВО';
+    private const LINKS_LABEL = 'ССЫЛКИ ДЛЯ ВСТАВКИ';
+
     public function __construct(
         protected AiClient $ai,
         protected PromptRenderer $renderer,
@@ -68,7 +72,16 @@ class GenerationService
             }
 
             try {
-                $article = $this->generateArticle($template->articlePromt->promt, $topic->topic, $site->url, $run);
+                $linksToInsert = $this->pickLinksForTopic(
+                    siteUrl: $site->url,
+                    siteId: $site->id,
+                    topic: $topic->topic,
+                    internalLastN: (int) $template->internal_links_last_n,
+                    internalCount: (int) $template->internal_links_count,
+                    permalinksCount: (int) $template->permalinks_count,
+                );
+
+                $article = $this->generateArticle($template->articlePromt->promt, $topic->topic, $site->url, $linksToInsert, $run);
 
                 $title = trim((string) ($article['title'] ?? ''));
                 $contentHtml = (string) ($article['content_html'] ?? '');
@@ -101,16 +114,6 @@ class GenerationService
                     ? $this->ensureCategoriesExistCustom($custom, $site->id, $selectedCategories)
                     : $this->ensureCategoriesExist($wp, $site->id, $selectedCategories);
 
-                $contentHtml = $this->applyLinking(
-                    siteUrl: $site->url,
-                    siteId: $site->id,
-                    topic: $topic->topic,
-                    contentHtml: $contentHtml,
-                    internalLastN: (int) $template->internal_links_last_n,
-                    internalCount: (int) $template->internal_links_count,
-                    permalinksCount: (int) $template->permalinks_count,
-                );
-
                 $recent = SitePost::query()
                     ->where('site_id', $site->id)
                     ->whereNotNull('content')
@@ -139,6 +142,17 @@ class GenerationService
                     ]);
                     continue;
                 }
+
+                $contentHtml = $this->applyLinking(
+                    siteUrl: $site->url,
+                    siteId: $site->id,
+                    topic: $topic->topic,
+                    contentHtml: $contentHtml,
+                    internalLastN: (int) $template->internal_links_last_n,
+                    internalCount: (int) $template->internal_links_count,
+                    permalinksCount: (int) $template->permalinks_count,
+                    links: $linksToInsert,
+                );
 
                 $authorWpId = null;
                 $localAuthorId = null;
@@ -172,6 +186,35 @@ class GenerationService
                     $payload['author'] = $authorWpId;
                 }
 
+                $localImagePath = $this->generateAndStoreFeaturedImage(
+                    siteId: (int) $site->id,
+                    topic: (string) $topic->topic,
+                    title: (string) $title,
+                    run: $run,
+                );
+
+                if ($localImagePath) {
+                    try {
+                        $localFile = Storage::disk('public')->path($localImagePath);
+                        $filename = basename($localFile);
+
+                        if ($isCustom && $custom) {
+                            $media = $custom->uploadMedia($localFile, $filename);
+                            $payload['featured_image'] = $media['path'] ?? $media['url'] ?? null;
+                        } elseif (!$isCustom && $wp) {
+                            $media = $wp->uploadMedia($localFile, $filename);
+                            $payload['featured_media'] = $media['id'] ?? null;
+                        }
+                    } catch (\Throwable $e) {
+                        Log::warning('Featured image upload failed', [
+                            'site_id' => $site->id,
+                            'run_id' => $run->id,
+                            'topic' => $topic->topic,
+                            'error' => $e->getMessage(),
+                        ]);
+                    }
+                }
+
                 $payload = Arr::where($payload, fn ($v) => $v !== null && $v !== '');
 
                 $wpPost = $isCustom ? $custom->createPost($payload) : $wp->createPost($payload);
@@ -199,6 +242,7 @@ class GenerationService
                         'summary' => $summary !== '' ? $summary : null,
                         'link' => $wpPost['link'] ?? null,
                         'author_id' => $localAuthorId,
+                        'image' => $localImagePath,
                         'ai_meta' => [
                             'template_id' => $template->id,
                             'run_id' => $run->id,
@@ -231,18 +275,32 @@ class GenerationService
         ]);
     }
 
-    private function generateArticle(string $promt, string $topic, string $siteUrl, GenerationRun $run): array
+
+    private function generateArticle(string $promt, string $topic, string $siteUrl, array $linksToInsert, GenerationRun $run): array
     {
         $userPrompt = $this->renderer->render($promt, [
             'topic' => $topic,
+            'keyword' => $topic,
             'site_url' => $siteUrl,
         ]);
-        $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, 'ТЕМА');
+        $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, self::TOPIC_LABEL);
         $userPrompt = $this->appendContextIfMissing($userPrompt, 'site_url', $siteUrl, 'SITE_URL');
+
+        if ($linksToInsert !== []) {
+            $userPrompt = rtrim($userPrompt) . "\n\n"
+                . self::LINKS_LABEL . ":\n"
+                . $this->formatLinksForPrompt($linksToInsert) . "\n\n"
+                . "ТРЕБОВАНИЯ К ССЫЛКАМ:\n"
+                . "- Вставь КАЖДУЮ ссылку ровно 1 раз в content_html.\n"
+                . "- URL не меняй.\n"
+                . "- Анкор используй как дано.\n"
+                . "- Встраивай ссылку в предложение/абзац по смыслу, НЕ делай отдельный абзац вида <p><a>...</a></p>.\n";
+        }
 
         $system = 'You are a content generator. Return ONLY valid JSON object with keys: '
             . '"title", "slug", "excerpt", "summary", "content_html". '
-            . 'Do not wrap in markdown. content_html must be valid HTML with <p> paragraphs.';
+            . 'Do not wrap in markdown. content_html must be valid HTML with <p> paragraphs. '
+            . 'If user provides "' . self::LINKS_LABEL . '", you MUST integrate those links naturally into content_html paragraphs (not as standalone link-only paragraphs).';
 
         $resp = $this->ai->chat([
             ['role' => 'system', 'content' => $system],
@@ -263,10 +321,11 @@ class GenerationService
     {
         $userPrompt = $this->renderer->render($promt, [
             'topic' => $topic,
+            'keyword' => $topic,
             'title' => $title,
             'content_html' => $contentHtml,
         ]);
-        $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, 'ТЕМА');
+        $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, self::TOPIC_LABEL);
         $userPrompt = $this->appendContextIfMissing($userPrompt, 'title', $title, 'ЗАГОЛОВОК');
 
         $system = 'Return ONLY valid JSON object with keys: "content_html".';
@@ -299,9 +358,10 @@ class GenerationService
         if (is_string($slugPromt) && trim($slugPromt) !== '') {
             $userPrompt = $this->renderer->render($slugPromt, [
                 'topic' => $topic,
+                'keyword' => $topic,
                 'title' => $title,
             ]);
-            $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, 'ТЕМА');
+            $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, self::TOPIC_LABEL);
             $userPrompt = $this->appendContextIfMissing($userPrompt, 'title', $title, 'ЗАГОЛОВОК');
 
             $system = 'Return ONLY valid JSON object with key: "slug".';
@@ -349,12 +409,13 @@ class GenerationService
         if (is_string($categoryPromt) && trim($categoryPromt) !== '' && $existing !== []) {
             $userPrompt = $this->renderer->render($categoryPromt, [
                 'topic' => $topic,
+                'keyword' => $topic,
                 'title' => $title,
                 'summary' => $summary,
                 'categories' => implode("\n", $existing),
                 'max' => $max,
             ]);
-            $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, 'ТЕМА');
+            $userPrompt = $this->appendContextIfMissing($userPrompt, 'topic', $topic, self::TOPIC_LABEL);
             $userPrompt = $this->appendContextIfMissing($userPrompt, 'title', $title, 'ЗАГОЛОВОК');
             $userPrompt = $this->appendContextIfMissing($userPrompt, 'summary', $summary, 'КРАТКО');
             $userPrompt = $this->appendContextIfMissing($userPrompt, 'categories', implode("\n", $existing), 'ДОСТУПНЫЕ РУБРИКИ');
@@ -508,7 +569,29 @@ class GenerationService
         int $internalLastN,
         int $internalCount,
         int $permalinksCount,
+        ?array $links = null,
     ): string {
+        $links = $links ?? $this->pickLinksForTopic(
+            siteUrl: $siteUrl,
+            siteId: $siteId,
+            topic: $topic,
+            internalLastN: $internalLastN,
+            internalCount: $internalCount,
+            permalinksCount: $permalinksCount,
+        );
+
+        return $this->links->insert($contentHtml, $links);
+    }
+
+
+    private function pickLinksForTopic(
+        string $siteUrl,
+        int $siteId,
+        string $topic,
+        int $internalLastN,
+        int $internalCount,
+        int $permalinksCount,
+    ): array {
         $links = [];
 
         $internalCount = max(0, $internalCount);
@@ -516,10 +599,15 @@ class GenerationService
         $permalinksCount = max(0, $permalinksCount);
 
         if ($internalCount > 0 && $internalLastN > 0) {
+            $internalLastN = max($internalLastN, $internalCount);
+
             $candidates = SitePost::query()
                 ->where('site_id', $siteId)
-                ->whereNotNull('slug')
-                ->where('status', 'publish')
+                ->whereIn('status', ['publish', 'published'])
+                ->where(function ($q) {
+                    $q->whereNotNull('slug')->orWhereNotNull('link');
+                })
+                ->whereNotNull('title')
                 ->orderByDesc('wp_id')
                 ->limit($internalLastN)
                 ->get();
@@ -582,7 +670,57 @@ class GenerationService
             }
         }
 
-        return $this->links->insert($contentHtml, $links);
+        return $links;
+    }
+
+    private function formatLinksForPrompt(array $links): string
+    {
+        $lines = [];
+        foreach ($links as $l) {
+            $url = (string) ($l['url'] ?? '');
+            $anchor = (string) ($l['anchor'] ?? '');
+            $newTab = (bool) ($l['new_tab'] ?? false);
+            if ($url === '' || $anchor === '') {
+                continue;
+            }
+            $lines[] = '- ' . $anchor . ' => ' . $url . ($newTab ? ' (new_tab: yes)' : ' (new_tab: no)');
+        }
+
+        return implode("\n", $lines);
+    }
+
+    private function generateAndStoreFeaturedImage(int $siteId, string $topic, string $title, GenerationRun $run): ?string
+    {
+        try {
+            $prompt = trim(
+                "Create a clean, modern featured image for a crypto blog article.\n"
+                . "Topic: {$topic}\n"
+                . "Title: {$title}\n"
+                . "No text in the image. Abstract tech / blockchain vibe. High contrast. Professional."
+            );
+
+            $bin = $this->ai->generateImagePng($prompt, [
+                'size' => '1024x1024',
+            ]);
+
+            $dir = "sites/{$siteId}/generated";
+            $name = 'featured-' . Str::uuid()->toString() . '.png';
+            $path = "{$dir}/{$name}";
+
+            Storage::disk('public')->put($path, $bin);
+
+            return $path;
+        } catch (\Throwable $e) {
+            Log::warning('Featured image generation failed', [
+                'site_id' => $siteId,
+                'run_id' => $run->id,
+                'topic' => $topic,
+                'title' => $title,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
     }
 }
 

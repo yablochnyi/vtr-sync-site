@@ -20,6 +20,7 @@ use Filament\Forms\Components\Textarea;
 use Filament\Forms\Components\TextInput;
 use Filament\Resources\RelationManagers\RelationManager;
 use Filament\Schemas\Schema;
+use Filament\Tables\Columns\ImageColumn;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Model;
@@ -71,7 +72,6 @@ class PostsRelationManager extends RelationManager
                     ->label('Загрузить новое изображение')
                     ->image()
                     ->disk('public')
-                    ->visible(fn () => ($this->ownerRecord->type_api ?? null) === 'wordpress')
                     ->directory(function ($record) {
                         $siteId = $this->ownerRecord->id;
                         $postWpId = $record?->wp_id ?? 'new';
@@ -98,6 +98,12 @@ class PostsRelationManager extends RelationManager
         return $table
             ->recordTitleAttribute('title')
             ->columns([
+                ImageColumn::make('image')
+                    ->label('')
+                    ->disk('public')
+                    ->imageSize(44)
+                    ->square()
+                    ->toggleable(isToggledHiddenByDefault: true),
                 TextColumn::make('title')
                     ->searchable(),
                 TextColumn::make('status')
