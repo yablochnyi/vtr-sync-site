@@ -6,12 +6,15 @@ use App\Models\GenerationRun;
 use App\Models\Permalink;
 use App\Models\SiteCategory;
 use App\Models\SitePost;
+use App\Models\User;
 use App\Services\AiClient;
 use App\Services\CustomApiService;
 use App\Services\WordPressApiService;
+use Filament\Notifications\Notification as FilamentNotification;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
@@ -64,6 +67,8 @@ class GenerationService
             login: $site->login,
             password: $site->api_key,
         ) : null;
+
+        $hadFailures = false;
 
         for ($i = 0; $i < (int) $template->articles_per_run; $i++) {
             $topic = $template->queryGroup->reserveNextTopic();
@@ -140,6 +145,14 @@ class GenerationService
                         'status' => 'failed',
                         'reserved_at' => null,
                     ]);
+                    $hadFailures = true;
+                    $this->recordFailure(
+                        run: $run,
+                        siteUrl: (string) $site->url,
+                        topic: (string) $topic->topic,
+                        reason: "Uniqueness {$uniqueness}% < min {$template->uniqueness_min_percent}%. Topic marked failed.",
+                        level: 'warning',
+                    );
                     continue;
                 }
 
@@ -266,11 +279,30 @@ class GenerationService
                     'status' => 'failed',
                     'reserved_at' => null,
                 ]);
+                $hadFailures = true;
+
+                Log::error('Generation topic failed', [
+                    'run_id' => $run->id,
+                    'site' => $site->url,
+                    'topic' => $topic->topic,
+                    'error' => $e->getMessage(),
+                ]);
+
+                $this->recordFailure(
+                    run: $run,
+                    siteUrl: (string) $site->url,
+                    topic: (string) $topic->topic,
+                    reason: $e->getMessage(),
+                    level: 'danger',
+                );
             }
         }
 
+        $run->refresh();
+
+        $finalStatus = $run->generated > 0 ? 'completed' : ($hadFailures ? 'failed' : 'completed');
         $run->update([
-            'status' => 'completed',
+            'status' => $finalStatus,
             'finished_at' => now(),
         ]);
     }
@@ -719,8 +751,69 @@ class GenerationService
                 'error' => $e->getMessage(),
             ]);
 
+            $this->recordFailure(
+                run: $run,
+                siteUrl: (string) ($run->template?->site?->url ?? ''),
+                topic: $topic,
+                reason: "Image generation failed: {$e->getMessage()}",
+                level: 'warning',
+            );
+
             return null;
         }
+    }
+
+    private function recordFailure(GenerationRun $run, string $siteUrl, string $topic, string $reason, string $level = 'danger'): void
+    {
+        try {
+            $users = User::query()->get();
+            $body = "run_id: {$run->id}\nsite: {$siteUrl}\ntopic: {$topic}\n\n{$reason}";
+
+            // Store failure details on the run for later viewing.
+            $meta = is_array($run->meta ?? null) ? $run->meta : [];
+            $failures = is_array($meta['failures'] ?? null) ? $meta['failures'] : [];
+            $failures[] = [
+                'ts' => now()->toAtomString(),
+                'topic' => $topic,
+                'reason' => $this->truncateForError($reason),
+                'level' => $level,
+            ];
+            // prevent unbounded growth
+            $meta['failures'] = array_slice($failures, -50);
+            $meta['failures_count'] = count($meta['failures']);
+
+            $run->update([
+                'meta' => $meta,
+                'error' => $this->truncateForError($reason),
+            ]);
+
+            if ($users->isNotEmpty()) {
+                $n = FilamentNotification::make()
+                    ->title($level === 'warning' ? 'Предупреждение генерации' : 'Ошибка генерации')
+                    ->body($this->truncateForError($body));
+
+                if ($level === 'warning') {
+                    $n->warning();
+                } else {
+                    $n->danger();
+                }
+
+                // Send immediately (do not rely on queue), because we are already in a queued job.
+                Notification::sendNow($users, $n->toDatabase());
+            }
+        } catch (\Throwable $e) {
+            // Never block generation because of notifications.
+        }
+    }
+
+    private function truncateForError(string $text): string
+    {
+        $max = 1500;
+        if (mb_strlen($text) <= $max) {
+            return $text;
+        }
+
+        return mb_substr($text, 0, $max - 50) . "\n...<truncated>...\n";
     }
 }
 

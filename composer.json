@@ -84,5 +84,11 @@
         }
     },
     "minimum-stability": "stable",
-    "prefer-stable": true
+    "prefer-stable": true,
+    "repositories": {
+        "filipfonal/filament-log-manager": {
+            "type": "vcs",
+            "url": "https://github.com/curder/filament-log-manager"
+        }
+    }
 }

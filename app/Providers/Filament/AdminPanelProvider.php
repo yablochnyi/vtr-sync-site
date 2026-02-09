@@ -6,6 +6,7 @@ use Filament\Http\Middleware\Authenticate;
 use Filament\Http\Middleware\AuthenticateSession;
 use Filament\Http\Middleware\DisableBladeIconComponents;
 use Filament\Http\Middleware\DispatchServingFilamentEvent;
+use Filament\Enums\DatabaseNotificationsPosition;
 use Filament\Pages\Dashboard;
 use Filament\Panel;
 use Filament\PanelProvider;
@@ -30,6 +31,8 @@ class AdminPanelProvider extends PanelProvider
             ->path('admin')
             ->login()
             ->spa()
+            ->databaseNotifications(position: DatabaseNotificationsPosition::Sidebar)
+            ->databaseNotificationsPolling('15s')
             ->renderHook(PanelsRenderHook::SIDEBAR_FOOTER, fn () => view('filament.sidebar.footer-ai-settings'))
             ->colors([
                 'primary' => Color::Violet,

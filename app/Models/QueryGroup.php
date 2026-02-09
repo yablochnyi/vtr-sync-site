@@ -27,7 +27,15 @@ class QueryGroup extends Model
         return DB::transaction(function () {
             /** @var QueryTopic|null $topic */
             $topic = $this->topics()
-                ->where('status', 'pending')
+                ->where(function ($q) {
+                    $q->whereIn('status', ['pending', 'failed'])
+                        ->orWhere(function ($q) {
+                            $q->where('status', 'reserved')
+                                ->whereNotNull('reserved_at')
+                                ->where('reserved_at', '<', now()->subMinutes(30));
+                        });
+                })
+                ->orderByRaw("case when status = 'pending' then 0 when status = 'failed' then 1 else 2 end")
                 ->orderBy('position')
                 ->orderBy('id')
                 ->lockForUpdate()
