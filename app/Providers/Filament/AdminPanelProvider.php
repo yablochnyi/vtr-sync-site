@@ -31,7 +31,7 @@ class AdminPanelProvider extends PanelProvider
             ->path('admin')
             ->login()
             ->spa()
-            ->databaseNotifications(position: DatabaseNotificationsPosition::Sidebar)
+            ->databaseNotifications()
             ->databaseNotificationsPolling('15s')
             ->renderHook(PanelsRenderHook::SIDEBAR_FOOTER, fn () => view('filament.sidebar.footer-ai-settings'))
             ->colors([
