@@ -8,6 +8,7 @@ use App\Models\Site;
 use App\Models\SiteAuthor;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TextInput;
+use Filament\Forms\Components\Toggle;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Schema;
 
@@ -113,6 +114,12 @@ class GenerationTemplateForm
                         ->maxValue(20)
                         ->required()
                         ->label('Постоянных ссылок'),
+
+                    Toggle::make('generate_images')
+                        ->label('Генерировать картинки')
+                        ->default(true)
+                        ->helperText('Если выключено — статьи будут публиковаться без featured image.')
+                        ->columnSpanFull(),
                 ]),
             Section::make('Автор')
                 ->columns(2)

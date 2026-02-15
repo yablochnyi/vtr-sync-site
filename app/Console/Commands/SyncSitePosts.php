@@ -124,6 +124,21 @@ class SyncSitePosts extends Command
             return new SitePost();
         }
 
+        $featuredImage = $post['featured_image'] ?? null;
+        $imageUrl = null;
+        if (is_string($featuredImage) && trim($featuredImage) !== '') {
+            $featuredImage = trim($featuredImage);
+            $imageUrl = str_starts_with($featuredImage, 'http://') || str_starts_with($featuredImage, 'https://')
+                ? $featuredImage
+                : rtrim((string) $site->url, '/') . '/storage/' . ltrim($featuredImage, '/');
+        }
+
+        $meta = array_filter([
+            'seo_title' => $post['seo_title'] ?? null,
+            'meta_description' => $post['meta_description'] ?? null,
+            'meta_keywords' => $post['meta_keywords'] ?? null,
+        ], fn ($v) => $v !== null);
+
         return SitePost::updateOrCreate(
             [
                 'wp_id' => $remoteId,
@@ -136,9 +151,9 @@ class SyncSitePosts extends Command
                 'slug' => $post['slug'] ?? null,
                 'link' => $post['link'] ?? null,
                 'status' => $post['status'] ?? 'draft',
-                'meta' => [],
+                'meta' => $meta,
                 'short_description' => strip_tags($post['excerpt'] ?? ''),
-                'image' => null,
+                'image' => $imageUrl,
                 'author_id' => null,
             ]
         );

@@ -16,6 +16,7 @@ use Filament\Forms\Components\CheckboxList;
 use Filament\Forms\Components\FileUpload;
 use Filament\Forms\Components\RichEditor;
 use Filament\Forms\Components\Select;
+use Filament\Forms\Components\TagsInput;
 use Filament\Forms\Components\Textarea;
 use Filament\Forms\Components\TextInput;
 use Filament\Resources\RelationManagers\RelationManager;
@@ -67,6 +68,22 @@ class PostsRelationManager extends RelationManager
                     ->required()
                     ->columnSpanFull()
                     ->label('Содержание статьи'),
+
+                TextInput::make('meta.seo_title')
+                    ->label('SEO Title')
+                    ->maxLength(255)
+                    ->columnSpanFull()
+                    ->helperText('Кастомный <title> (опционально).'),
+                TagsInput::make('meta.meta_keywords')
+                    ->label('Meta keywords')
+                    ->columnSpanFull()
+                    ->helperText('Список ключевых слов (опционально).'),
+                Textarea::make('meta.meta_description')
+                    ->label('Meta description')
+                    ->rows(3)
+                    ->maxLength(160)
+                    ->columnSpanFull()
+                    ->helperText('Описание для meta description (до 160 символов).'),
 
                 FileUpload::make('image')
                     ->label('Загрузить новое изображение')
@@ -156,6 +173,9 @@ class PostsRelationManager extends RelationManager
                 'excerpt' => $post->short_description,
                 'status' => $post->status ?? 'draft',
                 'categories' => $post->categories->pluck('wp_id')->filter()->values()->all(),
+                'seo_title' => data_get($post->meta ?? [], 'seo_title'),
+                'meta_keywords' => data_get($post->meta ?? [], 'meta_keywords'),
+                'meta_description' => data_get($post->meta ?? [], 'meta_description'),
             ];
 
             $remote = $post->wp_id
@@ -204,6 +224,7 @@ class PostsRelationManager extends RelationManager
 
         if ($post->wp_id) {
             $wpPost = $wp->updatePost($post->wp_id, $payload);
+            $this->syncWpSeoMeta($wp, (int) ($post->wp_id ?? 0), (array) ($post->meta ?? []));
         } else {
             $wpPost = $wp->createPost($payload);
 
@@ -212,7 +233,33 @@ class PostsRelationManager extends RelationManager
                 'link' => $wpPost['link'] ?? null,
             ]);
 
+            $this->syncWpSeoMeta($wp, (int) ($wpPost['id'] ?? 0), (array) ($post->meta ?? []));
+
             $this->moveImageDirectoryAfterCreation($post);
+        }
+    }
+
+    private function syncWpSeoMeta(WordPressApiService $wp, int $wpId, array $meta): void
+    {
+        if ($wpId <= 0) {
+            return;
+        }
+
+        $payloadMeta = array_filter([
+            'seo_title' => ($t = trim((string) ($meta['seo_title'] ?? ''))) !== '' ? $t : null,
+            'meta_description' => ($d = trim((string) ($meta['meta_description'] ?? ''))) !== '' ? $d : null,
+            'meta_keywords' => $meta['meta_keywords'] ?? null,
+        ], fn ($v) => $v !== null && $v !== '');
+
+        if ($payloadMeta === []) {
+            return;
+        }
+
+        try {
+            // WP accepts meta only when keys are registered with show_in_rest=true.
+            $wp->updatePost($wpId, ['meta' => $payloadMeta]);
+        } catch (\Throwable $e) {
+            // Best-effort only.
         }
     }
 

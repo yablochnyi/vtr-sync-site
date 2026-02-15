@@ -180,6 +180,15 @@ class GenerationService
                     }
                 }
 
+                $seoMeta = $this->generateSeoMeta(
+                    topic: (string) $topic->topic,
+                    title: (string) $title,
+                    excerpt: (string) $excerpt,
+                    summary: (string) $summary,
+                    siteUrl: (string) $site->url,
+                    run: $run,
+                );
+
                 $payload = [
                     'title' => $title,
                     'slug' => $slug,
@@ -199,33 +208,42 @@ class GenerationService
                     $payload['author'] = $authorWpId;
                 }
 
-                $localImagePath = $this->generateAndStoreFeaturedImage(
-                    siteId: (int) $site->id,
-                    topic: (string) $topic->topic,
-                    title: (string) $title,
-                    run: $run,
-                );
+                $localImagePath = null;
+                if ((bool) ($template->generate_images ?? true)) {
+                    $localImagePath = $this->generateAndStoreFeaturedImage(
+                        siteId: (int) $site->id,
+                        topic: (string) $topic->topic,
+                        title: (string) $title,
+                        run: $run,
+                    );
 
-                if ($localImagePath) {
-                    try {
-                        $localFile = Storage::disk('public')->path($localImagePath);
-                        $filename = basename($localFile);
+                    if ($localImagePath) {
+                        try {
+                            $localFile = Storage::disk('public')->path($localImagePath);
+                            $filename = basename($localFile);
 
-                        if ($isCustom && $custom) {
-                            $media = $custom->uploadMedia($localFile, $filename);
-                            $payload['featured_image'] = $media['path'] ?? $media['url'] ?? null;
-                        } elseif (!$isCustom && $wp) {
-                            $media = $wp->uploadMedia($localFile, $filename);
-                            $payload['featured_media'] = $media['id'] ?? null;
+                            if ($isCustom && $custom) {
+                                $media = $custom->uploadMedia($localFile, $filename);
+                                $payload['featured_image'] = $media['path'] ?? $media['url'] ?? null;
+                            } elseif (!$isCustom && $wp) {
+                                $media = $wp->uploadMedia($localFile, $filename);
+                                $payload['featured_media'] = $media['id'] ?? null;
+                            }
+                        } catch (\Throwable $e) {
+                            Log::warning('Featured image upload failed', [
+                                'site_id' => $site->id,
+                                'run_id' => $run->id,
+                                'topic' => $topic->topic,
+                                'error' => $e->getMessage(),
+                            ]);
                         }
-                    } catch (\Throwable $e) {
-                        Log::warning('Featured image upload failed', [
-                            'site_id' => $site->id,
-                            'run_id' => $run->id,
-                            'topic' => $topic->topic,
-                            'error' => $e->getMessage(),
-                        ]);
                     }
+                }
+
+                if ($isCustom) {
+                    $payload['seo_title'] = $seoMeta['seo_title'] ?? null;
+                    $payload['meta_keywords'] = $seoMeta['meta_keywords'] ?? null;
+                    $payload['meta_description'] = $seoMeta['meta_description'] ?? null;
                 }
 
                 $payload = Arr::where($payload, fn ($v) => $v !== null && $v !== '');
@@ -235,6 +253,11 @@ class GenerationService
                 $wpId = (int) ($wpPost['id'] ?? 0);
                 if ($wpId <= 0) {
                     throw new \RuntimeException('Remote API did not return post id.');
+                }
+
+                if (!$isCustom && $wp) {
+                    // Best-effort SEO meta update for WP (requires registered meta keys with show_in_rest).
+                    $this->syncWpSeoMeta($wp, $wpId, $seoMeta);
                 }
 
                 $localPost = SitePost::updateOrCreate(
@@ -256,6 +279,7 @@ class GenerationService
                         'link' => $wpPost['link'] ?? null,
                         'author_id' => $localAuthorId,
                         'image' => $localImagePath,
+                        'meta' => $seoMeta,
                         'ai_meta' => [
                             'template_id' => $template->id,
                             'run_id' => $run->id,
@@ -347,6 +371,122 @@ class GenerationService
         ]);
 
         return $this->json->parseObject($this->ai->extractFirstMessageContent($resp));
+    }
+
+    /**
+     * @return array{seo_title?:string,meta_description?:string,meta_keywords?:array<int,string>}
+     */
+    private function generateSeoMeta(string $topic, string $title, string $excerpt, string $summary, string $siteUrl, GenerationRun $run): array
+    {
+        try {
+            $topic = trim($topic);
+            $title = trim($title);
+
+            $userPrompt = "Сгенерируй SEO поля для статьи.\n"
+                . "ТЕМА И КЛЮЧЕВОЕ СЛОВО: {$topic}\n"
+                . "SITE_URL: {$siteUrl}\n"
+                . "TITLE: {$title}\n"
+                . "EXCERPT: " . trim($excerpt) . "\n"
+                . "SUMMARY: " . trim($summary) . "\n\n"
+                . "Требования:\n"
+                . "- seo_title: до 60 символов, человекочитаемо, включи ключевик (как есть) если возможно.\n"
+                . "- meta_description: до 160 символов, без кавычек/emoji, включи ключевик (как есть) если возможно.\n"
+                . "- meta_keywords: массив из 5-12 ключевых фраз (строки), первая фраза = ключевик (как есть).\n";
+
+            $system = 'Return ONLY valid JSON object with keys: "seo_title", "meta_description", "meta_keywords". '
+                . 'meta_keywords must be a JSON array of strings.';
+
+            $resp = $this->ai->chat([
+                ['role' => 'system', 'content' => $system],
+                ['role' => 'user', 'content' => $userPrompt],
+            ], [
+                'context' => [
+                    'purpose' => 'seo',
+                    'run_id' => $run->id,
+                    'template_id' => $run->generation_template_id,
+                    'topic' => $topic,
+                ],
+            ]);
+
+            $obj = $this->json->parseObject($this->ai->extractFirstMessageContent($resp));
+
+            $seoTitle = trim((string) ($obj['seo_title'] ?? ''));
+            $metaDescription = trim((string) ($obj['meta_description'] ?? ''));
+            $metaKeywords = $obj['meta_keywords'] ?? [];
+
+            if (!is_array($metaKeywords)) {
+                $metaKeywords = [];
+            }
+
+            $metaKeywords = array_values(array_filter(array_map(function ($v) {
+                $s = trim((string) $v);
+                return $s !== '' ? $s : null;
+            }, $metaKeywords)));
+
+            if ($seoTitle !== '') {
+                $seoTitle = mb_substr($seoTitle, 0, 255);
+            }
+            if ($metaDescription !== '') {
+                $metaDescription = mb_substr($metaDescription, 0, 160);
+            }
+
+            $out = [];
+            if ($seoTitle !== '') {
+                $out['seo_title'] = $seoTitle;
+            }
+            if ($metaDescription !== '') {
+                $out['meta_description'] = $metaDescription;
+            }
+            if ($metaKeywords !== []) {
+                $out['meta_keywords'] = $metaKeywords;
+            }
+
+            return $out;
+        } catch (\Throwable $e) {
+            Log::warning('SEO meta generation failed', [
+                'run_id' => $run->id,
+                'site' => $siteUrl,
+                'topic' => $topic,
+                'error' => $e->getMessage(),
+            ]);
+
+            $this->recordFailure(
+                run: $run,
+                siteUrl: $siteUrl,
+                topic: $topic,
+                reason: 'SEO meta generation failed: ' . $e->getMessage(),
+                level: 'warning',
+            );
+
+            return [];
+        }
+    }
+
+    private function syncWpSeoMeta(WordPressApiService $wp, int $wpId, array $seoMeta): void
+    {
+        if ($wpId <= 0 || $seoMeta === []) {
+            return;
+        }
+
+        $payloadMeta = array_filter([
+            'seo_title' => ($t = trim((string) ($seoMeta['seo_title'] ?? ''))) !== '' ? $t : null,
+            'meta_description' => ($d = trim((string) ($seoMeta['meta_description'] ?? ''))) !== '' ? $d : null,
+            'meta_keywords' => $seoMeta['meta_keywords'] ?? null,
+        ], fn ($v) => $v !== null && $v !== '');
+
+        if ($payloadMeta === []) {
+            return;
+        }
+
+        try {
+            $wp->updatePost($wpId, ['meta' => $payloadMeta]);
+        } catch (\Throwable $e) {
+            // Best-effort only.
+            Log::info('WP SEO meta update skipped/failed', [
+                'wp_id' => $wpId,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     private function rewriteArticle(string $promt, string $topic, string $title, string $contentHtml, GenerationRun $run): string
